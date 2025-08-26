@@ -5,16 +5,18 @@ import time
 from collections import deque
 
 # --- 설정값 ---
-BASE_EAR_THRESHOLD = 0.20      # EAR 기본값(얼굴크기(IPD)로 0.15~0.28 사이로 자동 보정)
-BLINK_THRESHOLD_PER_WIN = 20   # 깜빡임 윈도우 동안 필요한 횟수
-BLINK_WINDOW_SEC = 300         # 깜빡임 집계 윈도우(초)
+BASE_EAR_THRESHOLD = 0.20
+BLINK_THRESHOLD_PER_WIN = 20
+BLINK_WINDOW_SEC = 300
 
 # 정면 수평 판단용 (IPD 비례 가변 임계값)
-Y_THR_RATIO = 0.06             # 눈썹/눈/광대 y차이 임계 = IPD * 0.06 (대략)
-X_THR_RATIO = 0.05             # 중앙 위/아래 x차이 임계 = IPD * 0.05
-MIN_PX_THR  = 2.0              # 너무 작은 임계값 방지용 최소 px
+Y_THR_RATIO_BROW  = 0.06   # 눈썹 Δy
+Y_THR_RATIO_EYE   = 0.05   # 눈 Δy
+Y_THR_RATIO_CHEEK = 0.06   # 광대 Δy
+X_THR_RATIO_MID   = 0.05   # 중앙선 Δx
+MIN_PX_THR  = 2.0
 
-EMA_ALPHA = 0.2                # 지표 지수평활 정도(0~1)
+EMA_ALPHA = 0.2
 
 # --- 상태값 ---
 blink_count = 0
@@ -23,10 +25,9 @@ win_start = time.time()
 flip_view = False
 ema_vals = {}
 
-# --- MediaPipe 초기화 ---
-mp_drawing = mp.solutions.drawing_utils
+# --- MediaPipe ---
 mp_face = mp.solutions.face_mesh
-mp_pose = mp.solutions.pose  # (깜빡임/수평판단엔 불필요하지만, 원하시면 어깨 등도 표시 가능)
+mp_drawing = mp.solutions.drawing_utils
 
 # --- 보조 함수 ---
 def ema(key, value, alpha=EMA_ALPHA):
@@ -42,31 +43,44 @@ def safe_dist(a, b):
     a, b = np.array(a), np.array(b)
     return float(np.linalg.norm(a - b))
 
-def adaptive_thresh_by_ipd(ipd, ratio):
+def adaptive_thresh(ipd, ratio):
     if ipd is None or ipd <= 1:
-        return max(MIN_PX_THR, 60.0 * ratio)  # IPD를 모르면 60px 가정
+        return max(MIN_PX_THR, 60.0 * ratio)
     return max(MIN_PX_THR, ipd * ratio)
 
 def compute_ear(flm, w, h, left=True):
-    def fxy(i): 
+    def fxy(i):
         return np.array([flm[i].x * w, flm[i].y * h], dtype=np.float32)
     if left:
         p1,p2,p3,p5,p6,p4 = fxy(33), fxy(159), fxy(158), fxy(153), fxy(145), fxy(133)
     else:
         p1,p2,p3,p5,p6,p4 = fxy(263), fxy(386), fxy(385), fxy(380), fxy(374), fxy(362)
-    num = (np.linalg.norm(p2-p6) + np.linalg.norm(p3-p5))
-    den = (2.0 * np.linalg.norm(p1-p4))
-    if den < 1e-6:
-        return None
-    ear = float(num / den)
+    den = 2.0 * np.linalg.norm(p1-p4)
+    if den < 1e-6: return None
+    ear = (np.linalg.norm(p2-p6) + np.linalg.norm(p3-p5)) / den
     return float(np.clip(ear, 0.0, 1.0))
 
-# --- 비디오 실행 ---
+def draw_marker(img, pt, color, r=4, thick=2):
+    if pt is None: return
+    cv2.circle(img, (int(pt[0]), int(pt[1])), r, color, thick, lineType=cv2.LINE_AA)
+
+def draw_line(img, p1, p2, color, thick=2):
+    if p1 is None or p2 is None: return
+    cv2.line(img, (int(p1[0]), int(p1[1])), (int(p2[0]), int(p2[1])), color, thick, lineType=cv2.LINE_AA)
+
+def put_text(img, text, org, color, scale=0.7, thick=2):
+    cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, color, thick, cv2.LINE_AA)
+
+def draw_panel(img, x, y, w, h, alpha=0.35):
+    overlay = img.copy()
+    cv2.rectangle(overlay, (x,y), (x+w, y+h), (20,20,20), -1)
+    return cv2.addWeighted(overlay, alpha, img, 1-alpha, 0)
+
+# --- 메인 ---
 cap = cv2.VideoCapture(0)
 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
 with mp_face.FaceMesh(static_image_mode=False, max_num_faces=1, refine_landmarks=True, min_detection_confidence=0.5) as face_mesh:
-
     fps_deque = deque(maxlen=20)
     last_time = time.time()
 
@@ -74,80 +88,94 @@ with mp_face.FaceMesh(static_image_mode=False, max_num_faces=1, refine_landmarks
         ok, frame = cap.read()
         if not ok:
             break
-
         if flip_view:
             frame = cv2.flip(frame, 1)
 
         h, w = frame.shape[:2]
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         rgb.flags.writeable = False
-
         results_face = face_mesh.process(rgb)
-
         rgb.flags.writeable = True
         image = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
+        # 기본 색 정의
+        GREEN = (0, 210, 0)
+        RED   = (0, 0, 230)
+        YEL   = (0, 220, 220)
+        WHITE = (230, 230, 230)
+        GRAY  = (160, 160, 160)
+        CYAN  = (200, 255, 255)
+        BLUE  = (190, 160, 0)
+
         ipd_px = None
         head_level = None
-        detail_msgs = []
+        detail = {}
 
         if results_face.multi_face_landmarks:
             flm = results_face.multi_face_landmarks[0].landmark
+            def p(i): return np.array([flm[i].x * w, flm[i].y * h], dtype=np.float32)
 
-            def p(idx):
-                return np.array([flm[idx].x * w, flm[idx].y * h], dtype=np.float32)
+            # 포인트 추출
+            L_eye_outer, R_eye_outer = p(33), p(263)
+            L_eye_inner, R_eye_inner = p(133), p(362)
+            brow_L, brow_R = p(105), p(334)
+            cheek_L, cheek_R = p(50), p(280)
+            top_c, bot_c = p(10), p(152)
 
-            # --- 얼굴 크기: IPD(눈 사이 거리, 대략 바깥 눈꼬리 33-263) ---
-            L_eye_outer = p(33)
-            R_eye_outer = p(263)
+            # IPD
             ipd_px = safe_dist(L_eye_outer, R_eye_outer)
 
-            # --- 눈썹: 좌/우 대표점(105, 334) y차이 ---
-            brow_L = p(105)
-            brow_R = p(334)
-            dy_brow = abs(brow_L[1] - brow_R[1])
-            dy_brow_s = ema("dy_brow", dy_brow)
-            y_thr = adaptive_thresh_by_ipd(ipd_px, Y_THR_RATIO)
-            brow_ok = dy_brow_s is not None and dy_brow_s <= y_thr
-            detail_msgs.append(f"Brow Δy={dy_brow_s:.1f}px thr~{y_thr:.1f} -> {'OK' if brow_ok else 'TILT'}")
+            # 임계값
+            thr_brow  = adaptive_thresh(ipd_px, Y_THR_RATIO_BROW)
+            thr_eye   = adaptive_thresh(ipd_px, Y_THR_RATIO_EYE)
+            thr_cheek = adaptive_thresh(ipd_px, Y_THR_RATIO_CHEEK)
+            thr_mid   = adaptive_thresh(ipd_px, X_THR_RATIO_MID)
 
-            # --- 눈: 각 눈의 중앙(바깥/안쪽 눈꼬리 평균) y차이 ---
-            L_eye_inner = p(133)
-            R_eye_inner = p(362)
-            L_eye_c = (L_eye_outer + L_eye_inner) / 2.0
-            R_eye_c = (R_eye_outer + R_eye_inner) / 2.0
-            dy_eye = abs(L_eye_c[1] - R_eye_c[1])
-            dy_eye_s = ema("dy_eye", dy_eye)
-            eye_ok = dy_eye_s is not None and dy_eye_s <= y_thr
-            detail_msgs.append(f"Eyes Δy={dy_eye_s:.1f}px thr~{y_thr:.1f} -> {'OK' if eye_ok else 'TILT'}")
+            # 지표 계산 + EMA
+            dy_brow  = abs(brow_L[1] - brow_R[1]);   dy_brow_s  = ema("dy_brow", dy_brow)
+            dy_eye   = abs(((L_eye_outer+L_eye_inner)/2)[1] - ((R_eye_outer+R_eye_inner)/2)[1]); dy_eye_s = ema("dy_eye", dy_eye)
+            dy_cheek = abs(cheek_L[1] - cheek_R[1]); dy_cheek_s = ema("dy_cheek", dy_cheek)
+            dx_mid   = abs(top_c[0] - bot_c[0]);     dx_mid_s   = ema("dx_mid", dx_mid)
 
-            # --- 광대(치크본): 외곽 윤곽의 좌/우 치크 근방(50, 280) y차이 ---
-            cheek_L = p(50)
-            cheek_R = p(280)
-            dy_cheek = abs(cheek_L[1] - cheek_R[1])
-            dy_cheek_s = ema("dy_cheek", dy_cheek)
-            cheek_ok = dy_cheek_s is not None and dy_cheek_s <= y_thr
-            detail_msgs.append(f"Cheek Δy={dy_cheek_s:.1f}px thr~{y_thr:.1f} -> {'OK' if cheek_ok else 'TILT'}")
-
-            # --- 중앙 세로선: 이마(10) vs 턱(152) x좌표 차이 ---
-            top_c = p(10)
-            bot_c = p(152)
-            dx_mid = abs(top_c[0] - bot_c[0])
-            dx_mid_s = ema("dx_mid", dx_mid)
-            x_thr = adaptive_thresh_by_ipd(ipd_px, X_THR_RATIO)
-            mid_ok = dx_mid_s is not None and dx_mid_s <= x_thr
-            detail_msgs.append(f"Midline Δx={dx_mid_s:.1f}px thr~{x_thr:.1f} -> {'OK' if mid_ok else 'TILT'}")
-
-            # --- 최종 판단: 하나라도 OK면 수평 ---
+            brow_ok  = dy_brow_s  is not None and dy_brow_s  <= thr_brow
+            eye_ok   = dy_eye_s   is not None and dy_eye_s   <= thr_eye
+            cheek_ok = dy_cheek_s is not None and dy_cheek_s <= thr_cheek
+            mid_ok   = dx_mid_s   is not None and dx_mid_s   <= thr_mid
             head_level = (brow_ok or eye_ok or cheek_ok or mid_ok)
 
-            # --- EAR(깜빡임) 계산 ---
+            # -------- 보조선/마커 시각화 --------
+            # 눈썹 라인
+            draw_line(image, brow_L, brow_R, GREEN if brow_ok else RED, 3)
+            draw_marker(image, brow_L, BLUE, r=4); draw_marker(image, brow_R, BLUE, r=4)
+            put_text(image, f"Brows dy={dy_brow_s:.1f}/{thr_brow:.1f}px", (30, 80),
+                     GREEN if brow_ok else RED, 0.65, 2)
+
+            # 눈 중앙 라인
+            L_eye_c = (L_eye_outer + L_eye_inner)/2.0
+            R_eye_c = (R_eye_outer + R_eye_inner)/2.0
+            draw_line(image, L_eye_c, R_eye_c, GREEN if eye_ok else RED, 3)
+            draw_marker(image, L_eye_c, CYAN, r=4); draw_marker(image, R_eye_c, CYAN, r=4)
+            put_text(image, f"Eyes  dy={dy_eye_s:.1f}/{thr_eye:.1f}px", (30, 110),
+                     GREEN if eye_ok else RED, 0.65, 2)
+
+            # 광대 라인
+            draw_line(image, cheek_L, cheek_R, GREEN if cheek_ok else RED, 3)
+            draw_marker(image, cheek_L, (0,180,255), r=4); draw_marker(image, cheek_R, (0,180,255), r=4)
+            put_text(image, f"Cheek dy={dy_cheek_s:.1f}/{thr_cheek:.1f}px", (30, 140),
+                     GREEN if cheek_ok else RED, 0.65, 2)
+
+            # 중앙 세로선
+            draw_line(image, top_c, bot_c, GREEN if mid_ok else RED, 3)
+            draw_marker(image, top_c, YEL, r=5); draw_marker(image, bot_c, YEL, r=5)
+            put_text(image, f"Mid   dx={dx_mid_s:.1f}/{thr_mid:.1f}px", (30, 170),
+                     GREEN if mid_ok else RED, 0.65, 2)
+
+            # EAR / 깜빡임
             ear_l = compute_ear(flm, w, h, left=True)
             ear_r = compute_ear(flm, w, h, left=False)
             ear = None
             if ear_l is not None and ear_r is not None:
-                ear = (ear_l + ear_r) / 2.0
-                ear = ema("ear", ear)
+                ear = ema("ear", (ear_l + ear_r)/2.0)
 
             ear_thr = BASE_EAR_THRESHOLD
             if ipd_px is not None and ipd_px > 1:
@@ -162,31 +190,34 @@ with mp_face.FaceMesh(static_image_mode=False, max_num_faces=1, refine_landmarks
                         blink_count += 1
                         eye_closed = False
 
-        # --- 화면 표시 ---
+        # -------- 상단 상태 배지 --------
         title = "Head Level" if head_level else "Head Tilted" if head_level is not None else "Face: N/A"
-        color = (0, 200, 0) if head_level else ((0, 0, 255) if head_level is not None else (200, 200, 200))
-        cv2.putText(image, title, (30, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
+        title_color = (0, 200, 0) if head_level else ((0, 0, 230) if head_level is not None else (200,200,200))
+        put_text(image, title, (30, 40), title_color, 1.0, 2)
 
-        y0 = 80
-        for i, msg in enumerate(detail_msgs[:4]):
-            cv2.putText(image, msg, (30, y0 + i*30), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 0), 2)
+        # -------- 우측 패널: 요약/가이드 --------
+        panel_w = 300
+        image = draw_panel(image, w - panel_w - 20, 20, panel_w, 170, 0.35)
+        px, py = w - panel_w - 10, 40
+        put_text(image, "Summary", (px, py), WHITE, 0.8, 2); py += 28
+        put_text(image, "Green = within threshold", (px, py), (180,255,180), 0.6, 2); py += 22
+        put_text(image, "Red   = tilted", (px, py), (150,150,255), 0.6, 2); py += 22
+        put_text(image, "Keys: [f] flip  [r] reset  [q] quit", (px, py), GRAY, 0.55, 2); py += 22
 
-        # 깜빡임 윈도우 표시/리셋
+        # 깜빡임 표시(좌측 하단)
         now = time.time()
         elapsed = now - win_start
         if elapsed >= BLINK_WINDOW_SEC:
             pass_flag = (blink_count >= BLINK_THRESHOLD_PER_WIN)
-            blink_text = f"Blink {blink_count} / {BLINK_THRESHOLD_PER_WIN} in {int(elapsed)}s"
-            cv2.putText(image, blink_text, (30, h-60), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
-                        (0, 200, 0) if pass_flag else (0, 0, 255), 2)
+            msg = f"Blink {blink_count}/{BLINK_THRESHOLD_PER_WIN} in {int(elapsed)}s"
+            put_text(image, msg, (30, h - 60), (0, 220, 0) if pass_flag else RED, 0.75, 2)
             blink_count = 0
             win_start = now
         else:
             remain = BLINK_WINDOW_SEC - int(elapsed)
             pass_flag = (blink_count >= BLINK_THRESHOLD_PER_WIN)
-            blink_text = f"Blink {blink_count} / {BLINK_THRESHOLD_PER_WIN} (remain {remain}s)"
-            cv2.putText(image, blink_text, (30, h-60), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
-                        (0, 200, 0) if pass_flag else (255, 255, 0), 2)
+            msg = f"Blink {blink_count}/{BLINK_THRESHOLD_PER_WIN} (remain {remain}s)"
+            put_text(image, msg, (30, h - 60), (0, 220, 0) if pass_flag else (255, 255, 0), 0.75, 2)
 
         # FPS
         dt = now - last_time
@@ -194,13 +225,9 @@ with mp_face.FaceMesh(static_image_mode=False, max_num_faces=1, refine_landmarks
         if dt > 0:
             fps_deque.append(1.0/dt)
             fps = np.mean(fps_deque)
-            cv2.putText(image, f"FPS: {fps:.1f}", (w-140, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200,200,200), 2)
+            put_text(image, f"FPS: {fps:.1f}", (w - 130, h - 20), (200,200,200), 0.8, 2)
 
-        # 안내
-        cv2.putText(image, "Keys: [r]=reset  [f]=flip  [q]=quit", (30, h-25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (180,180,180), 2)
-
-        cv2.imshow("Front Pose - Head Level (FaceMesh)", image)
+        cv2.imshow("Front Pose - Head Level (with Guides)", image)
         key = cv2.waitKey(1) & 0xFF
         if key == ord('q'):
             break
