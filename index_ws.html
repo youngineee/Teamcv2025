@@ -1,0 +1,298 @@
+<!DOCTYPE html>
+<meta charset="utf-8" />
+<title>WebRTC Sender (Quality Tuned)</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  /* 전체 화면 활용 */
+  html,
+  body {
+    height: 100%;
+  }
+  body {
+    margin: 0;
+    padding: 12px;
+    box-sizing: border-box;
+    font: 15px/1.5 system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    min-height: 100dvh; /* Edge/모바일 대응 */
+    background: #0b0d10;
+    color: #eaeef2;
+  }
+
+  h1 {
+    margin: 0 0 4px 0;
+    font-size: 18px;
+    font-weight: 700;
+  }
+
+  /* 비디오가 남는 높이를 전부 차지 */
+  video {
+    flex: 1 1 auto; /* 남는 높이 채우기 */
+    width: 100%;
+    height: auto; /* flex 높이 우선, 필요시 자동 보정 */
+    min-height: 50vh; /* 너무 작아지지 않도록 최소 보장 */
+    object-fit: contain; /* 비율 유지, 검은 여백 허용 */
+    background: #000;
+    border-radius: 12px;
+  }
+
+  button,
+  select,
+  input {
+    padding: 8px 12px;
+    border-radius: 8px;
+    margin-right: 6px;
+    border: 1px solid #2a2f36;
+    background: #151a20;
+    color: #eaeef2;
+  }
+  button:hover,
+  select:hover,
+  input:hover {
+    filter: brightness(1.05);
+  }
+
+  .row {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    align-items: center;
+    margin: 0; /* 상하 여백 줄여서 화면 공간을 비디오에 더 줌 */
+  }
+
+  .log {
+    white-space: pre-wrap;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    background: #11161c;
+    color: #cfd6df;
+    padding: 10px;
+    border-radius: 8px;
+    border: 1px solid #2a2f36;
+    max-height: 22vh; /* 로그가 화면을 잡아먹지 않게 */
+    overflow: auto;
+  }
+
+  label {
+    font-weight: 600;
+  }
+</style>
+
+<h1>Phone → Laptop (WS/WSS signaling, Quality Controls)</h1>
+
+<video id="preview" autoplay playsinline muted></video>
+
+<div class="row">
+  <label>해상도</label>
+  <select id="res">
+    <option value="1280x720">1280×720 (720p)</option>
+    <option value="1920x1080" selected>1920×1080 (1080p)</option>
+    <option value="2560x1440">2560×1440 (QHD, 기기 지원 시)</option>
+  </select>
+
+  <label>FPS</label>
+  <select id="fps">
+    <option>24</option>
+    <option selected>30</option>
+  </select>
+
+  <label>비트레이트(Mbps)</label>
+  <input
+    id="br"
+    type="number"
+    step="0.1"
+    min="0.3"
+    value="2.5"
+    style="width: 90px"
+  />
+
+  <label><input id="h264" type="checkbox" checked /> H.264 우선</label>
+</div>
+
+<div class="row">
+  <button id="start">Start</button>
+  <button id="stop" disabled>Stop</button>
+</div>
+
+<div class="log" id="log"></div>
+
+<script>
+  const $ = (sel) => document.querySelector(sel);
+  const logEl = $('#log');
+  const vLocal = $('#preview');
+  const btnStart = $('#start');
+  const btnStop = $('#stop');
+
+  let ws, pc, localStream, sender;
+
+  function log(...a) {
+    const s = a.join(' ');
+    logEl.textContent += s + '\n';
+    logEl.scrollTop = logEl.scrollHeight; // 새 로그가 보이도록
+    console.log(...a);
+  }
+
+  function wsUrl() {
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    return `${proto}://${location.host}/ws`;
+  }
+
+  function parseRes(v) {
+    const [w, h] = v.split('x').map(Number);
+    return { width: w, height: h };
+  }
+
+  async function start() {
+    btnStart.disabled = true;
+
+    try {
+      const { width, height } = parseRes($('#res').value);
+      const fps = Number($('#fps').value);
+      const Mbps = Math.max(0.3, Number($('#br').value) || 2.5);
+      const preferH264 = $('#h264').checked;
+
+      const gUM = {
+        audio: false,
+        video: {
+          facingMode: { ideal: 'environment' },
+          width: { ideal: width, min: Math.min(1280, width) },
+          height: { ideal: height, min: Math.min(720, height) },
+          frameRate: { ideal: fps, max: fps },
+        },
+      };
+      localStream = await navigator.mediaDevices.getUserMedia(gUM);
+      vLocal.srcObject = localStream;
+      const videoTrack = localStream.getVideoTracks()[0];
+      videoTrack.contentHint = 'detail';
+
+      log(
+        '[getUserMedia] settings =',
+        JSON.stringify(videoTrack.getSettings())
+      );
+
+      ws = new WebSocket(wsUrl());
+      ws.onopen = () => log('WS: connected');
+      ws.onclose = () => log('WS: closed');
+      ws.onerror = (e) => log('WS: error', e?.message || '');
+
+      pc = new RTCPeerConnection({
+        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+      });
+
+      pc.onicecandidate = (e) => {
+        ws?.readyState === 1 &&
+          ws.send(
+            JSON.stringify({
+              type: 'candidate',
+              candidate: e.candidate
+                ? {
+                    candidate: e.candidate.candidate,
+                    sdpMid: e.candidate.sdpMid,
+                    sdpMLineIndex: e.candidate.sdpMLineIndex,
+                  }
+                : null,
+            })
+          );
+      };
+
+      pc.onconnectionstatechange = () => log('PC state:', pc.connectionState);
+
+      sender = pc.addTrack(videoTrack, localStream);
+
+      const params = sender.getParameters();
+      params.encodings = params.encodings || [{}];
+      params.encodings[0].maxBitrate = Math.round(Mbps * 1_000_000);
+      await sender.setParameters(params);
+      log(`[sender] maxBitrate ~= ${Mbps} Mbps 적용`);
+
+      try {
+        const transceiver = pc
+          .getTransceivers()
+          .find((t) => t.sender === sender);
+        if (preferH264 && transceiver && RTCRtpSender.getCapabilities) {
+          const caps = RTCRtpSender.getCapabilities('video');
+          const h264 = caps.codecs.filter((c) => /h264/i.test(c.mimeType));
+          const rest = caps.codecs.filter((c) => !/h264/i.test(c.mimeType));
+          if (h264.length) {
+            transceiver.setCodecPreferences([...h264, ...rest]);
+            log('[codec] H.264 우선 적용');
+          } else {
+            log('[codec] H.264 사용 불가(기기/브라우저 미지원)');
+          }
+        }
+      } catch (e) {
+        log('[codec] 설정 중 경고:', e.toString());
+      }
+
+      const offer = await pc.createOffer({ offerToReceiveVideo: false });
+      await pc.setLocalDescription(offer);
+
+      const sendOffer = () =>
+        ws.send(
+          JSON.stringify({ type: 'offer', sdp: pc.localDescription.sdp })
+        );
+      ws.readyState === 1
+        ? sendOffer()
+        : ws.addEventListener('open', sendOffer);
+
+      ws.onmessage = async (evt) => {
+        const msg = JSON.parse(evt.data);
+        if (msg.type === 'answer') {
+          await pc.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
+          log('Got answer. Streaming…');
+        } else if (msg.type === 'candidate') {
+          const c = msg.candidate;
+          await pc.addIceCandidate(
+            c
+              ? {
+                  candidate: c.candidate,
+                  sdpMid: c.sdpMid,
+                  sdpMLineIndex: c.sdpMLineIndex,
+                }
+              : null
+          );
+        }
+      };
+
+      btnStop.disabled = true;
+      setTimeout(() => (btnStop.disabled = false), 400);
+      log('Offer sent. 기다리는 중…');
+    } catch (err) {
+      log('Start failed:', err);
+      btnStart.disabled = false;
+    }
+  }
+
+  function stop() {
+    try {
+      ws && ws.readyState === 1 && ws.send(JSON.stringify({ type: 'bye' }));
+    } catch {}
+    try {
+      ws && ws.close();
+    } catch {}
+    ws = null;
+
+    try {
+      if (pc) pc.getSenders().forEach((s) => s.track && s.track.stop());
+    } catch {}
+    try {
+      pc && pc.close();
+    } catch {}
+    pc = null;
+
+    try {
+      if (localStream) localStream.getTracks().forEach((t) => t.stop());
+    } catch {}
+    localStream = null;
+
+    vLocal.srcObject = null;
+    btnStart.disabled = false;
+    btnStop.disabled = true;
+    log('Stopped.');
+  }
+
+  btnStart.onclick = start;
+  btnStop.onclick = stop;
+  window.addEventListener('pagehide', stop);
+</script>
